@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  scanner:
+    build: .
+    container_name: opportunity_scanner
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    command: >
+      sh -c "while true; do
+        python opportunity_scanner.py;
+        echo 'Sleeping 15 minutes...';
+        sleep 900;
+      done"
+    shm_size: '1gb'
