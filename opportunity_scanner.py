@@ -101,21 +101,23 @@ def send_telegram(message: str):
     except Exception as e:
         log.error(f"Telegram: {e}")
 
+def escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 def format_alert(title, source, url, budget, score, high) -> str:
     p = "🔴 HIGH PRIORITY" if high else "🟡 Match"
     return (f"{p} — Score {min(score,10)}/10\n\n"
-            f"<b>{title[:120]}</b>\n"
-            f"📌 {source}\n"
-            f"💰 {budget or 'Not specified'}\n"
+            f"<b>{escape_html(title[:120])}</b>\n"
+            f"📌 {escape_html(source)}\n"
+            f"💰 {escape_html(budget or 'Not specified')}\n"
             f"🔗 <a href='{url}'>View / Apply</a>")
-
 # ── API SOURCES ───────────────────────────────────────────────────────────────
 
 def fetch_remotive():
     try:
         r = requests.get("https://remotive.com/api/remote-jobs", params={"limit": 50}, timeout=15)
         jobs = [{"title": j.get("title",""), "url": j.get("url",""), "budget": j.get("salary",""),
-                 "description": j.get("description","")[:400], "source": "Remotive"}
+                 "description": j.get("description","")[:400], "posted_at": j.get("publication_date",""), "source": "Remotive"}
                 for j in r.json().get("jobs", [])]
         log.info(f"Remotive: {len(jobs)}")
         return jobs
@@ -127,7 +129,7 @@ def fetch_remoteok():
         data = requests.get("https://remoteok.com/api", headers={"User-Agent": "Mozilla/5.0"}, timeout=15).json()
         jobs = [{"title": j.get("position",""),
                  "url": j.get("url", f"https://remoteok.com/remote-jobs/{j.get('id','')}"),
-                 "budget": j.get("salary",""), "description": j.get("description","")[:400], "source": "Remote OK"}
+                 "budget": j.get("salary",""), "description": j.get("description","")[:400], "posted_at": j.get("date",""), "source": "Remote OK"}
                 for j in data if isinstance(j, dict) and "position" in j]
         log.info(f"Remote OK: {len(jobs)}")
         return jobs
@@ -219,7 +221,8 @@ async def scrape_google(page, queries):
             await page.goto(f"https://www.google.com/search?q={requests.utils.quote(query)}&tbs=qdr:d",
                             wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(random.uniform(2, 4))
-            for div in await page.query_selector_all("div.g")[:8]:
+            divs = await page.query_selector_all("div.g")
+            for div in divs[:8]:
                 try:
                     title_el   = await div.query_selector("h3")
                     link_el    = await div.query_selector("a[href^='http']")
@@ -248,7 +251,8 @@ async def scrape_x(page, queries):
             for _ in range(2):
                 await page.keyboard.press("End")
                 await asyncio.sleep(random.uniform(1, 2))
-            for tweet in await page.query_selector_all("article[data-testid='tweet']")[:10]:
+            tweets = await page.query_selector_all("article[data-testid='tweet']")
+            for tweet in tweets[:10]:
                 try:
                     text_el = await tweet.query_selector("[data-testid='tweetText']")
                     link_el = await tweet.query_selector("a[href*='/status/']")
@@ -272,7 +276,8 @@ async def scrape_linkedin(page, urls):
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
             await asyncio.sleep(random.uniform(3, 5))
-            for card in await page.query_selector_all(".job-search-card, .base-card")[:15]:
+            cards = await page.query_selector_all(".job-search-card, .base-card")
+            for card in cards[:15]:
                 try:
                     title_el = await card.query_selector("h3, .base-search-card__title")
                     link_el  = await card.query_selector("a[href*='/jobs/']")
@@ -338,6 +343,17 @@ def run_scan():
         jid = job_id(title, url)
         new_seen.add(jid)
         if jid in seen: continue
+
+        # Skip jobs older than 3 days
+        posted = job.get("posted_at", "")
+        if posted:
+            try:
+                from datetime import timezone
+                age = datetime.now(timezone.utc) - datetime.fromisoformat(posted.replace("Z", "+00:00"))
+                if age.days > 3:
+                    continue
+            except Exception:
+                pass
 
         score, high = score_job(title, job.get("description", ""))
         if score < MIN_SCORE: continue

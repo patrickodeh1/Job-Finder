@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
     libxdamage1 libxfixes3 libxrandr2 libgbm1 \
     libpango-1.0-0 libpangocairo-1.0-0 \
+    libasound2t64 \
     libgtk-3-0 libx11-xcb1 libxshmfence1 \
     fonts-liberation fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
