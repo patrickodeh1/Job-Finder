@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Full Opportunity Scanner v2
-Scans job boards, Reddit, HN, X (Twitter), LinkedIn, and Google Search
-Sends instant Telegram alerts for matching opportunities.
+Opportunity Scanner v3
+Strict 72-hour filter, negative keyword rejection, improved scoring.
+Sources: Remotive, RemoteOK, WWR, Arbeitnow, Himalayas, Reddit,
+         HN Who's Hiring, Dev.to, Nodesk, Jobicy, X, LinkedIn, Google
 """
 
 import os, json, time, random, hashlib, logging, asyncio
 import requests, feedparser
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
@@ -17,45 +18,66 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID_HERE")
 
 KEYWORDS = [
-    "django", "react", "python", "fastapi", "node.js", "nodejs",
+    "django", "fastapi", "react", "python", "node.js", "nodejs",
     "automation", "scraper", "scraping", "api integration",
-    "whatsapp bot", "telegram bot", "n8n", "zapier", "full stack",
-    "fullstack", "backend developer", "saas", "crm", "trading bot",
-    "forex", "webhook", "rest api", "postgresql", "postgres",
-    "web scraping", "data pipeline", "celery", "redis",
+    "whatsapp bot", "telegram bot", "n8n", "zapier",
+    "full stack", "fullstack", "backend developer", "backend engineer",
+    "saas", "crm", "trading bot", "forex", "webhook",
+    "rest api", "postgresql", "postgres", "web scraping",
+    "data pipeline", "celery", "redis", "freelance developer",
+    "remote developer", "hire developer", "need developer",
+    "looking for developer", "paying for",
 ]
 
 HIGH_PRIORITY_KEYWORDS = [
-    "django", "fastapi", "python", "trading", "forex",
-    "automation", "scraping", "whatsapp", "telegram bot",
+    "django", "fastapi", "trading", "forex", "automation",
+    "scraping", "whatsapp bot", "telegram bot", "n8n",
+    "hire django", "need django", "django developer",
+]
+
+NEGATIVE_KEYWORDS = [
+    "german speaking", "french speaking", "spanish speaking",
+    "customer success", "customer support manager",
+    "revenue operations", "account manager", "account executive",
+    "sales manager", "sales engineer", "solutions engineer",
+    "site reliability", "sre ", "devops engineer", "cloud engineer",
+    "network engineer", "security engineer", "penetration tester",
+    "graduate level", "phd", "stem ", "scientific python",
+    "data scientist", "machine learning engineer", "research engineer",
+    "ios developer", "android developer", "mobile developer",
+    "unity developer", "game developer", "blockchain",
+    "solidity", "web3", "nft", "crypto developer",
+    "sas developer", "cobol", "mainframe",
+    "product manager", "project manager", "scrum master",
+    "ux designer", "ui designer", "graphic designer",
+    "content writer", "copywriter", "seo specialist",
+    "social media manager", "marketing manager",
+    "hr manager", "recruiter", "talent acquisition",
 ]
 
 GOOGLE_QUERIES = [
-    "hiring django developer remote 2026",
-    "need python developer freelance",
-    "paying for automation developer",
-    "remote backend developer needed",
-    "hire fastapi developer",
-    "web scraping developer needed",
+    '"hiring" "django developer" remote',
+    '"need a python developer" freelance remote',
+    '"looking for" "django" OR "fastapi" developer freelance',
+    '"paying" "python developer" OR "backend developer" remote',
 ]
 
 X_QUERIES = [
-    "hiring django developer",
-    "need python developer remote",
-    "paying for developer",
-    "hire backend developer",
-    "remote python gig",
-    "need automation developer",
+    "hiring django developer remote",
+    "need python developer freelance paying",
+    "looking for backend developer remote",
+    "hire fastapi developer",
+    "django developer needed",
+    "python automation developer needed",
 ]
 
 LINKEDIN_URLS = [
-    "https://www.linkedin.com/jobs/search/?keywords=django%20developer&f_WT=2",
-    "https://www.linkedin.com/jobs/search/?keywords=python%20developer%20remote&f_WT=2",
-    "https://www.linkedin.com/jobs/search/?keywords=fastapi%20developer&f_WT=2",
+    "https://www.linkedin.com/jobs/search/?keywords=django%20developer&f_WT=2&f_TPR=r86400",
 ]
 
 SEEN_FILE = Path("/app/data/seen_jobs.json")
-MIN_SCORE = 2
+MIN_SCORE = 3
+MAX_AGE_H = 72
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -66,7 +88,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
-# ── HELPERS ──────────────────────────────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def load_seen() -> set:
     if SEEN_FILE.exists():
@@ -79,6 +101,25 @@ def save_seen(seen: set):
 
 def job_id(title: str, url: str) -> str:
     return hashlib.md5(f"{title}{url}".encode()).hexdigest()
+
+def is_recent(posted_at: str) -> bool:
+    if not posted_at:
+        return True
+    try:
+        if str(posted_at).isdigit():
+            dt = datetime.fromtimestamp(int(posted_at), tz=timezone.utc)
+        else:
+            posted_at = posted_at.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(posted_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - dt <= timedelta(hours=MAX_AGE_H)
+    except Exception:
+        return True
+
+def is_negative(title: str, description: str = "") -> bool:
+    text = f"{title} {description}".lower()
+    return any(kw in text for kw in NEGATIVE_KEYWORDS)
 
 def score_job(title: str, description: str = "") -> tuple:
     text = f"{title} {description}".lower()
@@ -111,13 +152,15 @@ def format_alert(title, source, url, budget, score, high) -> str:
             f"📌 {escape_html(source)}\n"
             f"💰 {escape_html(budget or 'Not specified')}\n"
             f"🔗 <a href='{url}'>View / Apply</a>")
+
 # ── API SOURCES ───────────────────────────────────────────────────────────────
 
 def fetch_remotive():
     try:
-        r = requests.get("https://remotive.com/api/remote-jobs", params={"limit": 50}, timeout=15)
-        jobs = [{"title": j.get("title",""), "url": j.get("url",""), "budget": j.get("salary",""),
-                 "description": j.get("description","")[:400], "posted_at": j.get("publication_date",""), "source": "Remotive"}
+        r = requests.get("https://remotive.com/api/remote-jobs", params={"limit": 100}, timeout=15)
+        jobs = [{"title": j.get("title",""), "url": j.get("url",""),
+                 "budget": j.get("salary",""), "description": j.get("description","")[:500],
+                 "posted_at": j.get("publication_date",""), "source": "Remotive"}
                 for j in r.json().get("jobs", [])]
         log.info(f"Remotive: {len(jobs)}")
         return jobs
@@ -129,7 +172,8 @@ def fetch_remoteok():
         data = requests.get("https://remoteok.com/api", headers={"User-Agent": "Mozilla/5.0"}, timeout=15).json()
         jobs = [{"title": j.get("position",""),
                  "url": j.get("url", f"https://remoteok.com/remote-jobs/{j.get('id','')}"),
-                 "budget": j.get("salary",""), "description": j.get("description","")[:400], "posted_at": j.get("date",""), "source": "Remote OK"}
+                 "budget": j.get("salary",""), "description": j.get("description","")[:500],
+                 "posted_at": str(j.get("epoch","")), "source": "Remote OK"}
                 for j in data if isinstance(j, dict) and "position" in j]
         log.info(f"Remote OK: {len(jobs)}")
         return jobs
@@ -138,12 +182,17 @@ def fetch_remoteok():
 
 def fetch_wwr():
     results = []
-    for url in ["https://weworkremotely.com/categories/remote-programming-jobs.rss",
-                "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss"]:
+    feeds = [
+        "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+        "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss",
+        "https://weworkremotely.com/categories/remote-full-stack-programming-jobs.rss",
+    ]
+    for url in feeds:
         try:
-            for e in feedparser.parse(url).entries[:20]:
+            for e in feedparser.parse(url).entries[:30]:
                 results.append({"title": e.get("title",""), "url": e.get("link",""),
-                                 "budget": "", "description": e.get("summary","")[:400], "source": "We Work Remotely"})
+                                 "budget": "", "description": e.get("summary","")[:500],
+                                 "posted_at": e.get("published",""), "source": "We Work Remotely"})
         except Exception as ex:
             log.error(f"WWR: {ex}")
     log.info(f"WWR: {len(results)}")
@@ -153,7 +202,8 @@ def fetch_arbeitnow():
     try:
         data = requests.get("https://www.arbeitnow.com/api/job-board-api", timeout=15).json()
         jobs = [{"title": j.get("title",""), "url": j.get("url",""), "budget": "",
-                 "description": j.get("description","")[:400], "source": "Arbeitnow"}
+                 "description": j.get("description","")[:500],
+                 "posted_at": str(j.get("created_at","")), "source": "Arbeitnow"}
                 for j in data.get("data", []) if j.get("remote")]
         log.info(f"Arbeitnow: {len(jobs)}")
         return jobs
@@ -162,30 +212,79 @@ def fetch_arbeitnow():
 
 def fetch_himalayas():
     try:
-        data = requests.get("https://himalayas.app/jobs/api", params={"limit": 50}, timeout=15).json()
+        data = requests.get("https://himalayas.app/jobs/api", params={"limit": 100}, timeout=15).json()
         jobs = [{"title": j.get("title",""), "url": j.get("applicationLink","https://himalayas.app"),
-                 "budget": j.get("salary",""), "description": j.get("description","")[:400], "source": "Himalayas"}
+                 "budget": j.get("salary",""), "description": j.get("description","")[:500],
+                 "posted_at": j.get("createdAt",""), "source": "Himalayas"}
                 for j in data.get("jobs", [])]
         log.info(f"Himalayas: {len(jobs)}")
         return jobs
     except Exception as e:
         log.error(f"Himalayas: {e}"); return []
 
+def fetch_devto():
+    results = []
+    try:
+        feed = feedparser.parse("https://dev.to/feed/tag/hiring")
+        for e in feed.entries[:30]:
+            results.append({"title": e.get("title",""), "url": e.get("link",""),
+                             "budget": "", "description": e.get("summary","")[:500],
+                             "posted_at": e.get("published",""), "source": "Dev.to"})
+        log.info(f"Dev.to: {len(results)}")
+    except Exception as e:
+        log.error(f"Dev.to: {e}")
+    return results
+
+def fetch_nodesk():
+    results = []
+    try:
+        feed = feedparser.parse("https://nodesk.co/remote-jobs/rss.xml")
+        for e in feed.entries[:30]:
+            results.append({"title": e.get("title",""), "url": e.get("link",""),
+                             "budget": "", "description": e.get("summary","")[:500],
+                             "posted_at": e.get("published",""), "source": "Nodesk"})
+        log.info(f"Nodesk: {len(results)}")
+    except Exception as e:
+        log.error(f"Nodesk: {e}")
+    return results
+
+def fetch_jobicy():
+    results = []
+    try:
+        r = requests.get("https://jobicy.com/api/v2/remote-jobs",
+                         params={"count": 50, "tag": "python"}, timeout=15)
+        for j in r.json().get("jobs", []):
+            results.append({"title": j.get("jobTitle",""), "url": j.get("url",""),
+                             "budget": str(j.get("annualSalaryMin","")),
+                             "description": j.get("jobDescription","")[:500],
+                             "posted_at": j.get("pubDate",""), "source": "Jobicy"})
+        log.info(f"Jobicy: {len(results)}")
+    except Exception as e:
+        log.error(f"Jobicy: {e}")
+    return results
+
 def fetch_reddit():
     results = []
-    headers = {"User-Agent": "OpportunityScanner/2.0"}
-    for sub in ["forhire", "slavelabour", "remotework", "django", "python"]:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; OpportunityBot/3.0; +https://github.com)"}
+    subreddits = ["forhire", "slavelabour", "remotework", "django", "python", "webdev"]
+    for sub in subreddits:
         try:
-            data = requests.get(f"https://www.reddit.com/r/{sub}/new.json",
-                                params={"limit": 25}, headers=headers, timeout=15).json()
-            for p in data["data"]["children"]:
+            r = requests.get(f"https://www.reddit.com/r/{sub}/new.json",
+                             params={"limit": 25}, headers=headers, timeout=15)
+            if r.status_code != 200:
+                log.warning(f"Reddit r/{sub}: HTTP {r.status_code}")
+                continue
+            for p in r.json()["data"]["children"]:
                 d = p["data"]
-                title = d.get("title", "")
-                if "[hiring]" in title.lower() or sub in ["django", "python", "remotework"]:
-                    results.append({"title": title,
-                                    "url": f"https://reddit.com{d.get('permalink','')}",
-                                    "budget": "", "description": d.get("selftext","")[:400],
-                                    "source": f"Reddit r/{sub}"})
+                title   = d.get("title", "")
+                created = d.get("created_utc", 0)
+                if sub in ["forhire", "slavelabour"] and "[hiring]" not in title.lower():
+                    continue
+                results.append({"title": title,
+                                 "url": f"https://reddit.com{d.get('permalink','')}",
+                                 "budget": "", "description": d.get("selftext","")[:500],
+                                 "posted_at": str(int(created)) if created else "",
+                                 "source": f"Reddit r/{sub}"})
             time.sleep(random.uniform(1, 2))
         except Exception as e:
             log.error(f"Reddit r/{sub}: {e}")
@@ -200,13 +299,14 @@ def fetch_hackernews():
         hits = r.json().get("hits", [])
         if hits:
             sid = hits[0]["objectID"]
-            r2 = requests.get("https://hn.algolia.com/api/v1/search",
-                               params={"tags": f"comment,story_{sid}", "hitsPerPage": 50}, timeout=15)
+            r2  = requests.get("https://hn.algolia.com/api/v1/search",
+                               params={"tags": f"comment,story_{sid}", "hitsPerPage": 100}, timeout=15)
             for c in r2.json().get("hits", []):
                 text = c.get("comment_text", "")
                 results.append({"title": text[:80].strip(),
                                  "url": f"https://news.ycombinator.com/item?id={c.get('objectID','')}",
-                                 "budget": "", "description": text[:400], "source": "HN Who's Hiring"})
+                                 "budget": "", "description": text[:500],
+                                 "posted_at": c.get("created_at",""), "source": "HN Who's Hiring"})
         log.info(f"HN: {len(results)}")
     except Exception as e:
         log.error(f"HN: {e}")
@@ -232,12 +332,13 @@ async def scrape_google(page, queries):
                     snippet = await snippet_el.inner_text() if snippet_el else ""
                     if title and href and "google.com" not in href:
                         results.append({"title": title.strip(), "url": href, "budget": "",
-                                         "description": snippet[:400], "source": "Google Search"})
+                                         "description": snippet[:500], "posted_at": "",
+                                         "source": "Google Search"})
                 except Exception:
                     continue
-            await asyncio.sleep(random.uniform(5, 10))
+            await asyncio.sleep(random.uniform(6, 12))
         except Exception as e:
-            log.error(f"Google '{query[:30]}': {e}")
+            log.error(f"Google '{query[:40]}': {e}")
     log.info(f"Google: {len(results)}")
     return results
 
@@ -248,11 +349,11 @@ async def scrape_x(page, queries):
             await page.goto(f"https://x.com/search?q={requests.utils.quote(query)}&src=typed_query&f=live",
                             wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(random.uniform(3, 6))
-            for _ in range(2):
+            for _ in range(3):
                 await page.keyboard.press("End")
                 await asyncio.sleep(random.uniform(1, 2))
             tweets = await page.query_selector_all("article[data-testid='tweet']")
-            for tweet in tweets[:10]:
+            for tweet in tweets[:15]:
                 try:
                     text_el = await tweet.query_selector("[data-testid='tweetText']")
                     link_el = await tweet.query_selector("a[href*='/status/']")
@@ -261,10 +362,11 @@ async def scrape_x(page, queries):
                     href = await link_el.get_attribute("href") if link_el else ""
                     url  = f"https://x.com{href}" if href.startswith("/") else href
                     results.append({"title": text[:100].strip(), "url": url or "https://x.com",
-                                     "budget": "", "description": text[:400], "source": "X (Twitter)"})
+                                     "budget": "", "description": text[:500],
+                                     "posted_at": "", "source": "X (Twitter)"})
                 except Exception:
                     continue
-            await asyncio.sleep(random.uniform(4, 8))
+            await asyncio.sleep(random.uniform(5, 10))
         except Exception as e:
             log.error(f"X '{query}': {e}")
     log.info(f"X: {len(results)}")
@@ -277,15 +379,18 @@ async def scrape_linkedin(page, urls):
             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
             await asyncio.sleep(random.uniform(3, 5))
             cards = await page.query_selector_all(".job-search-card, .base-card")
-            for card in cards[:15]:
+            for card in cards[:20]:
                 try:
                     title_el = await card.query_selector("h3, .base-search-card__title")
                     link_el  = await card.query_selector("a[href*='/jobs/']")
-                    title = await title_el.inner_text() if title_el else ""
-                    href  = await link_el.get_attribute("href") if link_el else ""
+                    time_el  = await card.query_selector("time")
+                    title  = await title_el.inner_text() if title_el else ""
+                    href   = await link_el.get_attribute("href") if link_el else ""
+                    posted = await time_el.get_attribute("datetime") if time_el else ""
                     if title and href:
                         results.append({"title": title.strip(), "url": href.split("?")[0],
-                                         "budget": "", "description": title, "source": "LinkedIn Jobs"})
+                                         "budget": "", "description": title,
+                                         "posted_at": posted, "source": "LinkedIn Jobs"})
                 except Exception:
                     continue
             await asyncio.sleep(random.uniform(5, 10))
@@ -296,25 +401,29 @@ async def scrape_linkedin(page, urls):
 
 async def run_playwright_sources():
     results = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
-        )
-        context = await browser.new_context(
-            user_agent=random.choice(USER_AGENTS),
-            viewport={"width": 1366, "height": 768},
-            locale="en-US", timezone_id="America/New_York",
-        )
-        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-        page = await context.new_page()
-
-        results += await scrape_google(page, GOOGLE_QUERIES)
-        results += await scrape_x(page, X_QUERIES)
-        results += await scrape_linkedin(page, LINKEDIN_URLS)
-
-        await browser.close()
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled"]
+            )
+            context = await browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                viewport={"width": 1366, "height": 768},
+                locale="en-US", timezone_id="America/New_York",
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            page = await context.new_page()
+            results += await scrape_google(page, GOOGLE_QUERIES)
+            results += await scrape_x(page, X_QUERIES)
+            results += await scrape_linkedin(page, LINKEDIN_URLS)
+            await browser.close()
+    except Exception as e:
+        log.error(f"Playwright: {e}")
     return results
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
@@ -324,39 +433,46 @@ def run_scan():
     log.info(f"Scan started — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     seen, new_seen, alerts = load_seen(), set(), 0
+    rejected_old = rejected_neg = rejected_score = 0
 
-    all_jobs = (fetch_remotive() + fetch_remoteok() + fetch_wwr() +
-                fetch_arbeitnow() + fetch_himalayas() + fetch_reddit() + fetch_hackernews())
+    all_jobs = (
+        fetch_remotive()   +
+        fetch_remoteok()   +
+        fetch_wwr()        +
+        fetch_arbeitnow()  +
+        fetch_himalayas()  +
+        fetch_devto()      +
+        fetch_nodesk()     +
+        fetch_jobicy()     +
+        fetch_reddit()     +
+        fetch_hackernews()
+    )
 
     try:
         all_jobs += asyncio.run(run_playwright_sources())
     except Exception as e:
         log.error(f"Playwright failed: {e}")
 
-    log.info(f"Total: {len(all_jobs)} opportunities")
+    log.info(f"Total fetched: {len(all_jobs)}")
 
     for job in all_jobs:
-        title = job.get("title", "").strip()
-        url   = job.get("url", "").strip()
+        title = job.get("title","").strip()
+        url   = job.get("url","").strip()
         if not title or not url: continue
 
         jid = job_id(title, url)
         new_seen.add(jid)
         if jid in seen: continue
 
-        # Skip jobs older than 3 days
-        posted = job.get("posted_at", "")
-        if posted:
-            try:
-                from datetime import timezone
-                age = datetime.now(timezone.utc) - datetime.fromisoformat(posted.replace("Z", "+00:00"))
-                if age.days > 3:
-                    continue
-            except Exception:
-                pass
+        if not is_recent(job.get("posted_at","")):
+            rejected_old += 1; continue
 
-        score, high = score_job(title, job.get("description", ""))
-        if score < MIN_SCORE: continue
+        if is_negative(title, job.get("description","")):
+            rejected_neg += 1; continue
+
+        score, high = score_job(title, job.get("description",""))
+        if score < MIN_SCORE:
+            rejected_score += 1; continue
 
         send_telegram(format_alert(title, job.get("source","Unknown"), url,
                                    job.get("budget",""), score, high))
@@ -364,6 +480,7 @@ def run_scan():
         time.sleep(1)
 
     save_seen(seen | new_seen)
+    log.info(f"Filtered — old: {rejected_old} | negative: {rejected_neg} | low score: {rejected_score}")
     log.info(f"Done. Alerts sent: {alerts}")
     log.info("=" * 55)
 
