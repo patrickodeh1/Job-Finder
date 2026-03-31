@@ -76,7 +76,7 @@ LINKEDIN_URLS = [
 ]
 
 SEEN_FILE = Path("/app/data/seen_jobs.json")
-MIN_SCORE = 3
+MIN_SCORE = 4
 MAX_AGE_H = 72
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -104,7 +104,7 @@ def job_id(title: str, url: str) -> str:
 
 def is_recent(posted_at: str) -> bool:
     if not posted_at:
-        return True
+        return False
     try:
         if str(posted_at).isdigit():
             dt = datetime.fromtimestamp(int(posted_at), tz=timezone.utc)
@@ -332,8 +332,7 @@ async def scrape_google(page, queries):
                     snippet = await snippet_el.inner_text() if snippet_el else ""
                     if title and href and "google.com" not in href:
                         results.append({"title": title.strip(), "url": href, "budget": "",
-                                         "description": snippet[:500], "posted_at": "",
-                                         "source": "Google Search"})
+                                         "description": snippet[:500], "posted_at": datetime.now(timezone.utc).isoformat(), "source": "Google Search"})
                 except Exception:
                     continue
             await asyncio.sleep(random.uniform(6, 12))
@@ -363,7 +362,7 @@ async def scrape_x(page, queries):
                     url  = f"https://x.com{href}" if href.startswith("/") else href
                     results.append({"title": text[:100].strip(), "url": url or "https://x.com",
                                      "budget": "", "description": text[:500],
-                                     "posted_at": "", "source": "X (Twitter)"})
+                                     "posted_at": datetime.now(timezone.utc).isoformat(), "source": "X (Twitter)"})
                 except Exception:
                     continue
             await asyncio.sleep(random.uniform(5, 10))
